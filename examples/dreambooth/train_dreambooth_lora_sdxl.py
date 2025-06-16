@@ -980,6 +980,8 @@ def encode_prompt(text_encoders, tokenizers, prompt, text_input_ids_list=None):
 
 
 def main(args):
+    
+    # wandb 用的，可以先不管
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
             "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
@@ -997,6 +999,7 @@ def main(args):
 
     logging_dir = Path(args.output_dir, args.logging_dir)
 
+    # accelerate config
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
     kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
@@ -1030,11 +1033,16 @@ def main(args):
         diffusers.utils.logging.set_verbosity_error()
 
     # If passed along, set the training seed now.
+    # 设置 seed
     if args.seed is not None:
         set_seed(args.seed)
 
-    # Generate class images if prior preservation is enabled.
-    if args.with_prior_preservation:
+    # Generate class images if prior preservation is enabled.4
+    # Life-long Learning 中"知识保留"的核心思想
+    # 如果我的图片非常少，更新的步数非常多，那么就有可能出现灾难性遗忘。
+    # 比如如果我想要生成贵宾犬的图像，train完之后，模型可能就不会生成普通的狗了
+    # 解决方法是我先用原模型生成一些 class 图像，然后和贵宾犬一起 train。这样模型就不会忘记如何生成同一个 class 下普通狗的样子了！
+    if args.with_prior_preservation: # 需要保留模型的某些先验
         class_images_dir = Path(args.class_data_dir)
         if not class_images_dir.exists():
             class_images_dir.mkdir(parents=True)
@@ -1090,7 +1098,9 @@ def main(args):
                 repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
             ).repo_id
 
-    # Load the tokenizers
+    # 以下开始正式训练。
+    
+    # Load the tokenizers（SDXL有两个 tokenizer）
     tokenizer_one = AutoTokenizer.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="tokenizer",
@@ -1105,6 +1115,8 @@ def main(args):
     )
 
     # import correct text encoder classes
+    # tokenize 之后要encode
+    # 这里码风不对，这里是动态import对应的class。不过最好的方法还是全部在最开始import完
     text_encoder_cls_one = import_model_class_from_model_name_or_path(
         args.pretrained_model_name_or_path, args.revision
     )
@@ -1113,6 +1125,7 @@ def main(args):
     )
 
     # Load scheduler and models
+    # 选择 scheduler
     scheduler_type = determine_scheduler_type(args.pretrained_model_name_or_path, args.revision)
     if "EDM" in scheduler_type:
         args.do_edm_style_training = True
@@ -1125,13 +1138,16 @@ def main(args):
         logger.info("Performing EDM-style training!")
     else:
         noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-
+    
+    # 加载模型
     text_encoder_one = text_encoder_cls_one.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
     )
     text_encoder_two = text_encoder_cls_two.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant
     )
+    
+    # 加载 VAE
     vae_path = (
         args.pretrained_model_name_or_path
         if args.pretrained_vae_model_name_or_path is None
@@ -1148,7 +1164,9 @@ def main(args):
         latents_mean = torch.tensor(vae.config.latents_mean).view(1, 4, 1, 1)
     if hasattr(vae.config, "latents_std") and vae.config.latents_std is not None:
         latents_std = torch.tensor(vae.config.latents_std).view(1, 4, 1, 1)
-
+    
+    # 加载 unet
+    
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
     )
@@ -1172,7 +1190,9 @@ def main(args):
         raise ValueError(
             "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
         )
-
+    
+    ### 以下就是一些设定，和主要逻辑每一个关系 ###
+    
     # Move unet, vae and text_encoder to device and cast to weight_dtype
     unet.to(accelerator.device, dtype=weight_dtype)
 
@@ -1201,7 +1221,11 @@ def main(args):
         if args.train_text_encoder:
             text_encoder_one.gradient_checkpointing_enable()
             text_encoder_two.gradient_checkpointing_enable()
-
+            
+    ###########################################
+    
+    # 这里码风也不对，函数套函数不适合代码复用
+    
     def get_lora_config(rank, dropout, use_dora, target_modules):
         base_config = {
             "r": rank,
@@ -1219,7 +1243,9 @@ def main(args):
                 base_config["use_dora"] = True
 
         return LoraConfig(**base_config)
-
+    
+    ### 以下是 lORA 设定，还有 accelerate 等加速设定，和主要逻辑也没关系 ###
+    
     # now we will add new LoRA weights to the attention layers
     unet_target_modules = ["to_k", "to_q", "to_v", "to_out.0"]
     unet_lora_config = get_lora_config(
@@ -1351,7 +1377,9 @@ def main(args):
 
         # only upcast trainable parameters (LoRA) into fp32
         cast_training_params(models, dtype=torch.float32)
-
+    
+    
+    # 激活 lora 的权重
     unet_lora_parameters = list(filter(lambda p: p.requires_grad, unet.parameters()))
 
     if args.train_text_encoder:
